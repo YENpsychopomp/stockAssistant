@@ -88,7 +88,6 @@ def getPriceTool(symbol: str) -> str:
         ticker = yf.Ticker(clean_symbol)
         data = ticker.info
         
-        # 取得現價 (處理多種可能的 Key)
         current_price = data.get('currentPrice') or data.get('regularMarketPrice')
         
         if not current_price:
@@ -235,45 +234,29 @@ async def stream_agent_query(user_input: str, history: list, cost_tracker: Token
     try:
         # 使用 async for 直接迭代 agent 的串流
         async for mode, chunk in agent.astream(state, stream_mode=["messages", "updates"]):
-            
-            # -------------------------------------------------
-            # 修正點：處理 'messages' 模式下的 Tuple
-            # -------------------------------------------------
             if mode == "messages":
-                # 預設 message 為 chunk 本身
                 msg = chunk
                 
                 # 如果是 Tuple (根據你的 Log，這裡是關鍵)，取出第一個元素
                 if isinstance(chunk, tuple):
                     msg = chunk[0]
                 
-                # 現在 msg 應該是 AIMessageChunk 了，檢查有沒有 content
                 if hasattr(msg, "content"):
-                    # 有些特殊狀況 content 是 list (多模態)，轉成字串防呆
                     text = msg.content
                     if isinstance(text, list):
                         text = "".join([str(x) for x in text])
                     
                     if text:
                         yield text
-
-            # -------------------------------------------------
-            # 處理 'updates' (修正後的 Usage 提取路徑)
-            # -------------------------------------------------
+            
             elif mode == "updates":
                 if isinstance(chunk, dict):
                     usage = None
-                    
-                    # 根據你提供的 Log 結構：chunk -> 'model' -> 'messages' -> AIMessage
                     if "model" in chunk and "messages" in chunk["model"]:
                         messages = chunk["model"]["messages"]
                         if messages:
-                            # 取得最後一條訊息（通常是 AIMessageChunk 或 AIMessage）
                             last_msg = messages[-1]
-                            # 使用 getattr 安全取得 usage_metadata
                             usage = getattr(last_msg, "usage_metadata", None)
-                    
-                    # 備份路徑 (有些版本直接在 chunk 裡)
                     elif "usage_metadata" in chunk:
                         usage = chunk["usage_metadata"]
 
@@ -283,7 +266,6 @@ async def stream_agent_query(user_input: str, history: list, cost_tracker: Token
                             input_tokens=usage.get("input_tokens", 0),
                             output_tokens=usage.get("output_tokens", 0),
                         )
-
     except Exception as e:
         print(f"發生錯誤: {e}")
         traceback.print_exc()
@@ -293,7 +275,6 @@ async def stream_agent_query(user_input: str, history: list, cost_tracker: Token
 # ==========================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request_body: dict, request: Request):
-    # --- A. 身分驗證與 ID 解析 ---
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.replace("Bearer ", "")
     
@@ -303,7 +284,7 @@ async def chat_completions(request_body: dict, request: Request):
         payload = jwt.decode(token, OPENWEBUI_SECRET_KEY, algorithms=["HS256"])
         user_id = payload.get("id")
     except Exception as e:
-        print(f"⚠️ JWT 解析失敗 (可能是測試模式或 Key 錯誤): {e}")
+        print(f"JWT 解析失敗 (可能是測試模式或 Key 錯誤): {e}")
         # 如果是測試模式，可以使用預設 ID，否則應回傳 401
         if TEST:
             user_id = "test_user_001"
@@ -345,17 +326,26 @@ async def chat_completions(request_body: dict, request: Request):
     
     history = []
     msg_index = len(message_list) - 2
+    isContinue = False
     while len(history) < 4 and msg_index >= 0:
         content = message_list[msg_index].get("content", "")
-        if message_list[msg_index].get("role") == "user":
+        role = message_list[msg_index].get("role")
+        current_idx = msg_index
+        msg_index -= 1 
+
+        if role == "user":
+            if isContinue:
+                isContinue = False
+                continue
             history.append(HumanMessage(content=content))
-        elif message_list[msg_index].get("role") == "assistant":
+
+        elif role == "assistant":
             if content == "您的額度已用完，請等待 24 小時後重置。":
-                history.pop()  # 把上一輪的 AI 回覆（提示用戶額度不足）從歷史中移除，避免干擾 Agent 判斷
-            else:
-                history.append(AIMessage(content=content))
-        msg_index -= 1
-        history.reverse()
+                isContinue = True
+                continue
+            history.append(AIMessage(content=content))
+            msg_index -= 1
+    history.reverse()
     # --- D. 定義串流生成器 (包含扣款邏輯) ---
     async def response_generator():
         # 初始化計費器
@@ -388,7 +378,7 @@ async def chat_completions(request_body: dict, request: Request):
             try:
                 deduct_quota(deduct_conn, user_id, float(total_cost))
             except Exception as e:
-                print(f"❌ 扣款失敗: {e}")
+                print(f"扣款失敗: {e}")
             finally:
                 deduct_conn.close()
 
